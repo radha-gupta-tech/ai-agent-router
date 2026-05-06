@@ -32,4 +32,4 @@ build/
 
 # Environment variables
 .env.local
-.env.production
+.env.production.env

@@ -1,9 +1,10 @@
 import os
-from fastapi import FastAPI
+import requests
+
+from fastapi import FastAPI, Header
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
-import requests
 
 from intent_router import detect_intent
 
@@ -12,7 +13,7 @@ load_dotenv()
 app = FastAPI()
 
 
-
+# CORS
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,117 +28,89 @@ app.add_middleware(
 
 class QueryRequest(BaseModel):
     query: str
-    project_id: str | None = None  
+    project_id: str | None = None
+    file_ids: list[str] | None = None
+    top_k: int = 8
+    include_sources: bool = True
+    conversation_id: str | None = None
 
 
+# RAG CALL
 
-# RAG CALL 
+def call_rag(
+    query: str,
+    project_id: str,
+    token: str | None = None,
+    file_ids=None,
+    top_k: int = 8,
+    include_sources: bool = True,
+    conversation_id: str | None = None,
+):
 
-def call_rag(query: str, project_id: str):
     try:
+
         payload = {
             "message": query,
-            "project_id": project_id
+            "project_id": project_id,
+            "file_ids": file_ids or [],
+            "top_k": top_k,
+            "include_sources": include_sources,
+            "conversation_id": conversation_id or "default_conv"
         }
 
         print("RAG PAYLOAD:", payload)
 
+        headers = {
+            "Content-Type": "application/json"
+        }
+
+        # Only attach token if available
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
         res = requests.post(
-            os.getenv("RAG_API_URL"),
+            f"{os.getenv('RAG_API_URL')}/api/v1/chat",
+            headers=headers,
             json=payload,
             timeout=None
         )
 
+        print("RAG STATUS:", res.status_code)
+        print("RAG RESPONSE:", res.text)
+
         res.raise_for_status()
+
         data = res.json()
 
-        print("RAG FULL RESPONSE:", data)        # ← full response dekho
-        print("RAG ANSWER:", data.get("answer")) # ← answer field
-        print("RAG KEYS:", data.keys())          # ← kaunse fields aa rahe hain
-
-        return data.get("answer", "No answer from RAG")
+        return {
+            "success": True,
+            "answer": data.get("answer", "No answer found"),
+            "sources": data.get("sources", [])
+        }
 
     except Exception as e:
-        print("RAG EXCEPTION:", str(e))
-        return f"RAG Error: {str(e)}"
 
+        print("RAG ERROR:", str(e))
+
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 # DEEPSEEK LLM
 
 def call_llm(query: str):
+
     SYSTEM_PROMPT = """
-
-You are Archietech AI, a professional and intelligent assistant.
-
-Your responsibilities:
-- Help with general questions (weather, knowledge, casual queries)
-- Help with construction and project-related queries
-- Maintain a clean, short, and professional response style
-
-GENERAL RULES:
-- Always respond in English
-- Keep answers short (1–3 sentences)
-- Be clear and direct
-- Do NOT over-explain
-
-----------------------------------------
-GREETING BEHAVIOR (STRICT):
-----------------------------------------
-If the user input is EXACTLY one of these:
-hi, hello, hey, hy
-
-→ Respond EXACTLY:
-"Hi! I'm Archietech AI. How can I help you today?"
-
-Do NOT trigger greeting for words like:
-yes, ok, sure, thanks
-
-----------------------------------------
-GENERAL QUERIES:
-----------------------------------------
-- Answer normally (weather, knowledge, casual questions)
-- Do NOT block general queries
-- Be helpful and concise
-
-Example:
-User: what is weather today
-Assistant: Provide a normal answer
-
-----------------------------------------
-PROJECT / CONSTRUCTION QUERIES:
-----------------------------------------
-If the query involves:
-- rooms, layout,beams, walls, dimensions
-- drawing, DWG, plan, building structure,pdf
-- "kitne rooms", "wall thickness", etc.
-
-→ Assume it is project-related
+You are Archietech AI.
 
 Rules:
-- Answer ONLY based on project data (RAG context)
-- If data is not available → say:
+- Always reply in English
+- Keep answers short and professional
+- Never hallucinate project data
+- If data not available say:
   "Not found in project data"
-
-- NEVER guess or hallucinate project details
-
-----------------------------------------
-IRRELEVANT / INAPPROPRIATE QUERIES:
-----------------------------------------
-If query is:
-- personal (dating, relationship, etc.)
-- unrelated nonsense
-
-→ Respond:
-"I’m here to help with useful questions. Please ask something relevant."
-
-----------------------------------------
-IMPORTANT:
-----------------------------------------
-- NEVER make up project data
-- NEVER assume room counts, dimensions, etc.
-- If unsure → say "Not found in project data"
 """
-
 
     response = requests.post(
         "https://api.deepseek.com/v1/chat/completions",
@@ -148,48 +121,97 @@ IMPORTANT:
         json={
             "model": "deepseek-chat",
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": query}
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT
+                },
+                {
+                    "role": "user",
+                    "content": query
+                }
             ]
         }
     )
 
+    response.raise_for_status()
+
     return response.json()["choices"][0]["message"]["content"]
 
 
-# -----------------------------
-# MAIN ROUTE
-# -----------------------------
+# MAIN CHAT ROUTE
+
 @app.post("/chat")
-def chat(req: QueryRequest):
+def chat(
+    req: QueryRequest,
+    authorization: str = Header(None)
+):
+
     query = req.query
-    project_id = req.project_id   
+    project_id = req.project_id
+
+    # EXTRACT TOKEN FROM INCOMING REQUEST
+
+    token = None
+
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ")[1]
+
+    print("TOKEN:", token)
 
     intent = detect_intent(query)
 
-    #  RAG only if project_id present
-    if intent == "construction" and project_id:
-        rag_answer = call_rag(query, project_id)
+    print("QUERY:", query)
+    print("INTENT:", intent)
 
-        if "Error" in rag_answer or "Timeout" in rag_answer:
+    # CONSTRUCTION / PROJECT QUERY
+
+    if intent == "construction":
+
+        if not project_id:
+            return {
+                "source": "SYSTEM",
+                "answer": "Please select a project first."
+            }
+
+        rag_response = call_rag(
+            query=query,
+            project_id=project_id,
+            token=token,
+            file_ids=req.file_ids,
+            top_k=req.top_k,
+            include_sources=req.include_sources,
+            conversation_id=req.conversation_id
+        )
+
+        # FALLBACK TO LLM
+
+        if not rag_response["success"]:
+
             return {
                 "source": "LLM_FALLBACK",
-                "answer": call_llm(query)
+                "answer": call_llm(query),
+                "error": rag_response["error"]
             }
 
         return {
             "source": "RAG",
-            "answer": rag_answer
+            "answer": rag_response["answer"],
+            "sources": rag_response["sources"]
         }
 
-    # If project-related but no project selected
-    if intent == "construction" and not project_id:
-        return {
-            "source": "SYSTEM",
-            "answer": "Please select a project first."
-        }
+    # GENERAL QUERY
 
     return {
         "source": "DEEPSEEK",
         "answer": call_llm(query)
+    }
+
+
+# HEALTH CHECK
+
+@app.get("/")
+def root():
+    return {
+        "status": "running",
+        "service": "Archietech AI Router"
     }
