@@ -1,15 +1,12 @@
-
-
 import requests
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-
 CONSTRUCTION_KEYWORDS = [
     "cement", "brick", "wall", "beam", "column",
-    "foundation", "floor plan", "dwg","pdf", "autocad",
+    "foundation", "floor plan", "layers", "dwg", "pdf", "autocad",
     "room", "rooms", "dimension", "layout", "door",
     "window", "plumbing", "electrical", "structure",
     "staircase", "building", "construction", "material",
@@ -46,24 +43,35 @@ construction OR general
 Query: {query}
 """
 
-    response = requests.post(
-        "https://api.deepseek.com/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": "deepseek-chat",
-            "messages": [
-                {"role": "user", "content": prompt}
-            ]
-        }
-    )
+    try:
+        response = requests.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ]
+            },
+            timeout=10,
+        )
 
-    data = response.json()
-    result = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        data = response.json()
 
-    return result.strip().lower()
+        result = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+
+        return result.strip().lower()
+
+    except Exception as exc:
+        print(f"[IntentClassifier] DeepSeek failed: {exc}")
+        return "general"
 
 
 def detect_intent(query: str) -> str:
